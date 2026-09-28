@@ -22,6 +22,11 @@ from .examples import (
     InvalidExampleDocumentError,
     validate_document_examples,
 )
+from .materializer import (
+    InvalidMaterializeRequestError,
+    MaterializationError,
+    materialize_request,
+)
 from .overlay import (
     MAX_ACTIONS,
     MIN_ACTIONS,
@@ -71,7 +76,18 @@ app = FastAPI(
         "frozen per action, array removals run in descending index order, "
         "and any zero-match/invalid action rejects the whole batch with "
         "422. The transformed contract, per-action matched JSON Pointers "
-        "and a SHA-256 digest are returned."
+        "and a SHA-256 digest are returned. "
+        "POST /requests/materialize takes a contract, one operation "
+        "selector and parameter values grouped by location, resolves local "
+        "$refs cycle-safe while merging path-level and operation-level "
+        "parameters (operation (in,name) wins), and renders request_target, "
+        "headers and a Cookie value using the default style/explode rules "
+        "(path simple/label/matrix, query form/spaceDelimited/"
+        "pipeDelimited/deepObject, header simple, cookie form), including "
+        "arrays, objects, allowReserved, repeated query keys and percent "
+        "encoding; missing required values, unknown values, duplicate "
+        "parameters or dangling references reject the request with 422 and "
+        "JSON Pointer sources."
     ),
 )
 
@@ -157,6 +173,56 @@ class ComposeRequest(BaseModel):
 class ExamplesValidateRequest(BaseModel):
     document: Dict[str, Any] = Field(
         ..., description="The OpenAPI 3.x JSON document whose examples are validated."
+    )
+
+
+class MaterializeRequest(BaseModel):
+    document: Dict[str, Any] = Field(
+        ..., description="The OpenAPI 3.x JSON document describing the operation."
+    )
+    selector: str = Field(
+        ...,
+        description=(
+            "The operation selector of the form 'METHOD /path', e.g. "
+            "'GET /pets/{id}'. The method is case-insensitive and the path "
+            "must match a declared path key exactly."
+        ),
+    )
+    values: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Parameter values grouped by location: an object whose keys are "
+            "any of 'path', 'query', 'header', 'cookie'; each value maps "
+            "parameter names to JSON values (primitive, array or object, "
+            "according to the declared style). Omitted optional parameters "
+            "are simply not rendered. Unknown groups or non-object groups "
+            "are rejected with 400."
+        ),
+    )
+
+
+class MaterializeResponse(BaseModel):
+    request_target: str = Field(
+        ...,
+        description=(
+            "The origin-form request target (RFC 7230): the path with every "
+            "template substituted, followed by '?' and the rendered query "
+            "string when query parameters are present."
+        ),
+    )
+    headers: Dict[str, str] = Field(
+        ...,
+        description=(
+            "Rendered 'in: header' parameters keyed by their declared header "
+            "name; stable (name-sorted) and never containing 'Cookie'."
+        ),
+    )
+    cookie: str = Field(
+        ...,
+        description=(
+            "The Cookie header value rendered from 'in: cookie' parameters "
+            "with the form style; an empty string when there are none."
+        ),
     )
 
 
@@ -323,6 +389,7 @@ def root() -> Dict[str, str]:
         "compose": "POST /compose",
         "examples_validate": "POST /examples/validate",
         "overlay_apply": "POST /overlay/apply",
+        "requests_materialize": "POST /requests/materialize",
     }
 
 
@@ -606,3 +673,45 @@ def overlay_apply(payload: OverlayRequest) -> JSONResponse:
         status_code=200,
         content={"contract": contract, "actions": reports, "sha256": digest},
     )
+
+
+@app.post(
+    "/requests/materialize",
+    response_model=MaterializeResponse,
+    responses={
+        400: {"description": "Bad document shape, malformed selector, unknown operation, or malformed values grouping"},
+        422: {
+            "description": "Missing required value, unknown supplied value, "
+            "duplicate parameter, unsupported value/style combination, or a "
+            "dangling/circular/non-local reference"
+        },
+    },
+    summary="Materialize request target, headers and cookies for one operation",
+)
+def requests_materialize(payload: MaterializeRequest) -> JSONResponse:
+    try:
+        result = materialize_request(
+            payload.document, payload.selector, payload.values
+        )
+    except InvalidMaterializeRequestError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_materialize_request",
+                "messages": exc.messages,
+            },
+        )
+    except MaterializationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "invalid_materialization",
+                "message": (
+                    "the request could not be materialized: one or more "
+                    "parameters are missing, duplicated, unknown, or carry "
+                    "a value their declared style cannot serialize"
+                ),
+                "issues": exc.issues,
+            },
+        )
+    return JSONResponse(status_code=200, content=result)
