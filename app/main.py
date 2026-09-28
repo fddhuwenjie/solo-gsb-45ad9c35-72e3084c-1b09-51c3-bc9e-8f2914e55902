@@ -22,6 +22,19 @@ from .examples import (
     InvalidExampleDocumentError,
     validate_document_examples,
 )
+from .materializer import (
+    InvalidDocumentError as InvalidMaterializeDocumentError,
+)
+from .materializer import (
+    InvalidRequestError as InvalidMaterializeRequestError,
+)
+from .materializer import (
+    InvalidSelectorError as InvalidMaterializeSelectorError,
+)
+from .materializer import (
+    MaterializationError,
+    materialize_request,
+)
 from .overlay import (
     MAX_ACTIONS,
     MIN_ACTIONS,
@@ -71,7 +84,17 @@ app = FastAPI(
         "frozen per action, array removals run in descending index order, "
         "and any zero-match/invalid action rejects the whole batch with "
         "422. The transformed contract, per-action matched JSON Pointers "
-        "and a SHA-256 digest are returned."
+        "and a SHA-256 digest are returned. "
+        "POST /requests/materialize resolves one operation (local $refs "
+        "cycle-safe, path-level parameters merged with operation-level "
+        "ones, the latter overriding the former by (in, name)) and builds "
+        "the request target, headers and Cookie from grouped parameter "
+        "values using the default/explicit styles (path simple/label/"
+        "matrix, query form/spaceDelimited/pipeDelimited/deepObject, "
+        "header simple, cookie form), including arrays, objects, "
+        "allowReserved, repeated query keys and percent-encoding; missing "
+        "required values, unknown or duplicate parameters and dangling "
+        "references return 422 with source JSON Pointers."
     ),
 )
 
@@ -210,6 +233,57 @@ class OverlayResponse(BaseModel):
             "encoding of 'contract'."
         ),
     )
+
+
+class MaterializeRequest(BaseModel):
+    document: Dict[str, Any] = Field(
+        ..., description="The OpenAPI 3.x JSON document describing the operation."
+    )
+    selector: str = Field(
+        ...,
+        description=(
+            "The operation to materialize, in the 'METHOD /path' form "
+            "(e.g. 'GET /pets/{petId}'); method is case-insensitive."
+        ),
+    )
+    values: Optional[Any] = Field(
+        default=None,
+        description=(
+            "Parameter values grouped by location: 'path', 'query', "
+            "'header' and 'cookie', each an object mapping the declared "
+            "parameter name to its JSON value. Header name matching is "
+            "case-insensitive; null (or omission) skips an optional "
+            "parameter and is rejected for required parameters."
+        ),
+    )
+
+
+class MaterializeResponse(BaseModel):
+    request_target: str = Field(
+        ...,
+        description=(
+            "The origin-form request target: the path template substituted "
+            "with the serialized path parameters, followed by '?' and the "
+            "serialized query string when query parameters are present."
+        ),
+    )
+    headers: Dict[str, str] = Field(
+        ...,
+        description=(
+            "Serialized HTTP headers contributed by 'in: header' parameters, "
+            "keyed by the declared header names. The Cookie header is "
+            "reported separately in 'cookie'."
+        ),
+    )
+    cookie: str = Field(
+        ...,
+        description=(
+            "The serialized Cookie header value ('name=value' pairs joined "
+            "by '; '), or an empty string when no cookie parameters are "
+            "supplied."
+        ),
+    )
+
 class ExampleErrorModel(BaseModel):
     side: Literal["request", "response"] = Field(
         ..., description="Whether the example belongs to a requestBody or a response."
@@ -323,6 +397,7 @@ def root() -> Dict[str, str]:
         "compose": "POST /compose",
         "examples_validate": "POST /examples/validate",
         "overlay_apply": "POST /overlay/apply",
+        "requests_materialize": "POST /requests/materialize",
     }
 
 
@@ -605,4 +680,69 @@ def overlay_apply(payload: OverlayRequest) -> JSONResponse:
     return JSONResponse(
         status_code=200,
         content={"contract": contract, "actions": reports, "sha256": digest},
+    )
+
+
+@app.post(
+    "/requests/materialize",
+    response_model=MaterializeResponse,
+    responses={
+        400: {
+            "description": "The document is not OpenAPI 3.x, the selector "
+            "is malformed/unknown, or the values envelope is malformed"
+        },
+        422: {
+            "description": "A required value is missing/unknown/duplicate, "
+            "a value does not fit its declared style, a path template is "
+            "inconsistent, or a local $ref is dangling or circular; each "
+            "error carries its source JSON Pointer"
+        },
+    },
+    summary="Materialize request target, headers and Cookie for one operation",
+)
+def requests_materialize(payload: MaterializeRequest) -> JSONResponse:
+    try:
+        request_target, headers, cookie = materialize_request(
+            payload.document, payload.selector, payload.values
+        )
+    except InvalidMaterializeDocumentError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_openapi_document",
+                "messages": exc.messages,
+            },
+        )
+    except InvalidMaterializeSelectorError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_selector", "messages": exc.messages},
+        )
+    except InvalidMaterializeRequestError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_materialize_request",
+                "messages": exc.messages,
+            },
+        )
+    except MaterializationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "materialization_failed",
+                "message": (
+                    "the request could not be materialized; fix the reported "
+                    "parameters, values or references first"
+                ),
+                "errors": exc.errors,
+            },
+        )
+    return JSONResponse(
+        status_code=200,
+        content={
+            "request_target": request_target,
+            "headers": headers,
+            "cookie": cookie,
+        },
     )

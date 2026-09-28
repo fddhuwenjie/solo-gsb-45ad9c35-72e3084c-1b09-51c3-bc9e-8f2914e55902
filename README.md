@@ -1,6 +1,6 @@
 # OpenAPI 契约兼容性审计 API
 
-用 Python + FastAPI 实现的 OpenAPI 3.x 契约服务，提供五个接口：
+用 Python + FastAPI 实现的 OpenAPI 3.x 契约服务，提供六个接口：
 
 - **`POST /audit`**：提交**基线版**与**候选版**两份 OpenAPI 3.x JSON 文档，服务会解析本地 `$ref`（循环安全），并按以下策略判定候选版是否向后兼容：
 
@@ -34,6 +34,17 @@
   （错误含动作索引，不返回半成品）。成功返回变换后的契约、逐动作实际命中的 JSON Pointer
   与规范 JSON 的 **SHA-256**，命中与报告稳定排序，且不修改请求对象。
 
+- **`POST /requests/materialize`**：提交**一份** OpenAPI 3.x 文档、一个 `METHOD /path`
+  操作选择器与按位置分组（`path` / `query` / `header` / `cookie`）的参数值，
+  生成可直接发出的 HTTP 请求三件套：**`request_target`**（路径模板替换后拼接查询串）、
+  **`headers`** 与 **Cookie 头值**。本地 `$ref`（含参数引用与 OpenAPI 3.1 path-level
+  `$ref` 链）循环安全解析；path-level 与 operation-level 参数按 `(in, name)` 合并、
+  后者覆盖前者。遵循各位置默认 `style` / `explode`，支持 path 的
+  simple/label/matrix、query 的 form/spaceDelimited/pipeDelimited/deepObject、
+  header simple 与 cookie form，处理数组、对象、`allowReserved`、重复查询键与
+  百分号编码。缺少必填值、未知值、重复参数、值与样式不匹配或悬空 / 循环引用一律
+  返回 422，并附来源 JSON Pointer；输出稳定且不修改请求对象。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件）。在项目根目录执行：
@@ -52,6 +63,7 @@ docker compose up --build
 | 网关契约合成接口 | `POST http://localhost:8080/compose` |
 | 示例校验接口 | `POST http://localhost:8080/examples/validate` |
 | 覆盖动作接口 | `POST http://localhost:8080/overlay/apply` |
+| 请求物化接口 | `POST http://localhost:8080/requests/materialize` |
 | 交互式 API 文档（Swagger UI） | http://localhost:8080/docs |
 | OpenAPI 描述文档 | http://localhost:8080/openapi.json |
 
@@ -617,6 +629,147 @@ curl -s -X POST http://localhost:8080/overlay/apply \
 > 所有 422 都是整批拒绝：响应不含 `contract`，请求中的文档对象也不会被改动。
 > `actions` 不是数组时由 FastAPI 以默认 422 格式返回。
 
+## `POST /requests/materialize`：物化操作的请求目标、headers 与 Cookie
+
+给定**一份** OpenAPI 3.x 文档、一个操作选择器与一组参数值，服务解析该操作的有效参数
+（循环安全），按 OpenAPI 3 参数序列化规则生成实际 HTTP 请求的三个部分：
+
+- **`request_target`**：origin-form 请求目标——路径模板中的 `{name}` 被替换为序列化后的
+  path 参数，存在 query 参数时再拼接 `?` 与查询串；
+- **`headers`**：每个 `in: header` 参数一个键值对（键为契约中声明的头名，值为序列化结果）；
+- **`cookie`**：由全部 `in: cookie` 参数组成的 `Cookie` 头值（`name=value` 以 `; ` 连接）；
+  Cookie 不会重复出现在 `headers` 中。
+
+### 参数合并与引用解析
+
+- **path-level 与 operation-level 合并**：先按文档顺序排列 path-level 参数，再追加仅在
+  operation-level 声明的参数；operation-level 参数与 path-level 参数具有相同
+  **`(in, name)`** 时**整体覆盖**前者（OpenAPI 3 规范）。
+- **同级重复参数**（同一 parameters 数组中两个相同 `(in, name)`，或两个仅大小写不同的
+  header 参数）为 422，错误同时给出两处来源 Pointer。
+- 参数与 path item 上的本地 `$ref` 均被解析：参数 `$ref` 跟随到组件定义，报错时
+  定义类问题（缺值、样式不合法等）指向**组件位置**、引用类问题（悬空、循环）指向
+  **`$ref` 所在位置**。OpenAPI 3.1 下 `$ref` 的同级字段逐层合并（近者优先）；
+  3.0 文档严格遵循旧规范、忽略同级字段。path-level `$ref` 链（含 3.1
+  `components/pathItems`）同样循环安全，超深链按上限拒绝。
+
+### 默认样式与支持矩阵
+
+未声明 `style` / `explode` 时采用各位置默认值：
+
+| 位置 | 支持的 style | 默认 style | 默认 explode |
+| --- | --- | --- | --- |
+| path | `simple` / `label` / `matrix` | `simple` | `false` |
+| query | `form` / `spaceDelimited` / `pipeDelimited` / `deepObject` | `form` | `true` |
+| header | `simple` | `simple` | `false` |
+| cookie | `form` | `form` | （cookie 表忽略 explode） |
+
+序列化与 OpenAPI 3.0.3 规范示例表一致，例如：
+
+- path `simple`：标量 `id`；数组 `a,b,c`；对象 explode 为 `k=v,k2=v2`、非 explode 为
+  `k,v,k2,v2`。`label` 带 `.` 前缀（数组 explode 用 `.` 连接）；`matrix` 为
+  `;id=...`（数组 explode 重复 `;id=`，对象 explode 直接用属性名）。
+- query `form`：数组 explode 产生**重复查询键** `id=a&id=b`，非 explode 为 `id=a,b`；
+  对象 explode 用属性名作为查询键。`spaceDelimited` / `pipeDelimited` 仅接受数组
+  （非 explode 分别用 `%20`、`|` 连接；explode 仍重复查询键）。`deepObject` 仅接受对象，
+  输出 `id[role]=admin`，并始终是 exploded 形态。
+- query 的 **`allowReserved: true`** 允许 RFC 3986 保留字符（`:/?#[]@!$&'()*+,;=`）
+  原样出现在值中；默认情况下所有非 unreserved 字节都按 UTF-8 **百分号编码**
+  （空格为 `%20`、`€` 为 `%E2%82%AC`）。序列化结构分隔符（`&`、`=`、`,`、`|`、`%20`、
+  方括号）本身保持原样。
+- header `simple` 不做百分号编码（逗号 / 等号为结构分隔符）；值中含 CR / LF / NUL
+  时返回 422；请求里的头名按**大小写不敏感**匹配，输出使用契约声明的名字。
+- cookie `form` 按 cookie 表序列化：数组 `a,b`、对象 `k,v,k2,v2`（explode 被忽略），
+  各 token 按 unreserved 集合百分号编码，多个 cookie 以 `; ` 连接。
+- 布尔值渲染为 `true` / `false`；数字按 JSON 数值文本渲染；数组元素与对象属性值必须是
+  标量（字符串 / 数字 / 布尔），嵌套数组、对象或 `null` 元素返回 422。对象成员按
+  **键名升序**输出，因此结果与输入键序无关。
+
+### 请求
+
+```bash
+curl -s -X POST http://localhost:8080/requests/materialize \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "document": { "openapi": "3.0.3", "info": {"title": "Pet API", "version": "1.0"},
+                  "paths": {"/pets/{petId}": {"...": "..."}} },
+    "selector": "GET /pets/{petId}",
+    "values": {
+      "path":   {"petId": "cat/42"},
+      "query":  {"tags": ["cute", "small"], "filter": {"status": "available"}},
+      "header": {"X-Tenant": "demo"},
+      "cookie": {"session": "abc"}
+    }
+  }'
+```
+
+- `document`：一份 OpenAPI 3.x JSON 文档（对象）。
+- `selector`：形如 `METHOD /path` 的单个选择器（方法大小写不敏感，路径须逐字匹配）。
+- `values`（可省略）：按位置分组的参数值；header 名大小写不敏感匹配。
+  显式传 `null` 等同未提供该值——必填参数因此报错，可选参数则从请求中省略。
+
+### 成功响应（`200`）
+
+```json
+{
+  "request_target": "/pets/cat%2F42?tags=cute&tags=small&status=available",
+  "headers": {"X-Tenant": "demo"},
+  "cookie": "session=abc"
+}
+```
+
+> 上例中 `filter` 是默认 form+explode 的对象，属性名直接成为查询键（`status=available`）；
+> 若契约声明 `style: deepObject`，对应片段为 `filter[status]=available`（方括号保持原样）。
+> 重复查询键按参数声明顺序排列；query 参数整体也按声明顺序输出。
+
+### 错误响应
+
+- `400 invalid_openapi_document`：`document` 缺少 `openapi: 3.x` 或 `paths` 对象。
+- `400 invalid_selector`：选择器不是 `METHOD /path` 形态，或路径 / 方法不存在。
+- `400 invalid_materialize_request`：`values` 不是对象、含未知分组（只允许
+  `path` / `query` / `header` / `cookie`）或某个分组不是对象。
+- `422 materialization_failed`：所有语义问题一次报齐，`errors` 按
+  `(code, in, name, pointer, error)` 稳定排序，每条至少带一个**来源 JSON Pointer**：
+
+| code | 触发情形 | 典型 pointer |
+| --- | --- | --- |
+| `missing_required_value` | 必填参数（path 参数恒必填）未提供值（含显式 `null`） | 参数定义位置（`$ref` 跟随到组件） |
+| `unknown_value` | 为操作未声明的参数提供了值 | `/values/<in>/<name>` |
+| `ambiguous_value` | header 分组里出现仅大小写不同的两个键 | `/values/header/<name>` |
+| `duplicate_parameter` | 同级参数数组重复 `(in, name)`，或 header 参数仅大小写冲突 | 后一处定义位置，附 `first_pointer` |
+| `invalid_value_shape` | 值与样式不匹配（deepObject 非对象、space/pipe 非数组、标量样式收到结构值等） | `/values/<in>/<name>` |
+| `unsupported_style` | 样式不属于该位置的支持矩阵 | 参数的 `/style` 位置 |
+| `unsupported_parameter` | 参数使用 `content` 媒体类型对象（不支持物化） | 参数定义位置 |
+| `invalid_parameter` | 缺少字符串 `name`、`in` 非法、参数 / path item 不是对象、头名不是合法 token 等 | 问题节点位置 |
+| `invalid_path_template` | 模板变量没有对应参数、path 参数未在模板中使用、模板花括号非法 | path item 或参数位置 |
+| `unresolvable_reference` | 参数 / path item 的本地 `$ref` 悬空、非本地或循环 | `$ref` 所在位置，附 `ref` |
+
+```json
+{
+  "error": "materialization_failed",
+  "message": "the request could not be materialized; fix the reported parameters, values or references first",
+  "errors": [
+    {
+      "code": "missing_required_value",
+      "pointer": "/paths/~1pets~1{petId}/get/parameters/0",
+      "in": "path",
+      "name": "petId",
+      "error": "missing value for required path parameter 'petId'"
+    },
+    {
+      "code": "unresolvable_reference",
+      "pointer": "/paths/~1pets/get/parameters/2",
+      "ref": "#/components/parameters/Missing",
+      "error": "unresolvable reference '#/components/parameters/Missing': object has no property 'Missing'"
+    }
+  ]
+}
+```
+
+> 与其他接口一致：物化过程**不会修改**请求中的 `document` / `values` 对象；
+> 对象类型的值按键名升序序列化、数组按声明顺序序列化，同样的契约与值无论输入键序如何，
+> 始终得到字节相同的 `request_target` / `headers` / `cookie`。
+
 ## 检查的变更类别
 
 | category | 说明 | 判定为 breaking 的方向 |
@@ -706,7 +859,18 @@ integer/number 与布尔值区分、enum/const/allOf/anyOf/oneOf/数值·字符�
 过滤器与递归下降 422）、`update` 递归合并与整体替换、`remove` 根节点禁止、
 同一动作命中冻结与数组倒序删除、后续动作基于前序结果匹配、逐命中独立深拷贝、
 零命中 / 非法动作 422（含动作索引）与整批原子性、动作数量 1～50 边界、
-请求对象不被修改、命中与报告稳定排序、SHA-256 可复算等共 247 个用例。
+请求对象不被修改、命中与报告稳定排序、SHA-256 可复算；
+以及 `/requests/materialize` 的 path simple/label/matrix 与 query form/
+spaceDelimited/pipeDelimited/deepObject（数组、对象、explode 两种形态、
+空集合、重复查询键）、`allowReserved` 与百分号编码（保留字符 / Unicode /
+方括号结构符）、header simple 与大小写不敏感匹配、cookie form 序列化与 Cookie
+拼接、默认 style/explode、布尔与数值渲染、嵌套结构 / null 值 422、
+path-level 与 operation-level 参数合并（后者按 `(in, name)` 覆盖、
+仅追加 operation 独有参数）、同级重复参数与仅大小写冲突的 header 参数 422
+（含两处 Pointer）、参数与 3.1 path-level `$ref` 解析（悬空 / 外部 / 循环 422、
+3.1 同级字段覆盖、3.0 忽略同级）、必填缺失 / 未知值 / 歧义 header 键 422、
+路径模板一致性、400 文档 / 选择器 / 请求包体边界、多错误齐报与稳定排序、
+输出与输入键序无关、请求对象不被修改等共 326 个用例。
 
 ## 项目结构
 
@@ -714,19 +878,21 @@ integer/number 与布尔值区分、enum/const/allOf/anyOf/oneOf/数值·字符�
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py          # FastAPI 路由、请求/响应模型、输入校验（/audit、/slice、/compose、/examples/validate 与 /overlay/apply）
+│   ├── main.py          # FastAPI 路由、请求/响应模型、输入校验（/audit、/slice、/compose、/examples/validate、/overlay/apply 与 /requests/materialize）
 │   ├── audit.py         # 契约比较引擎（操作/参数/请求体/响应/schema）
 │   ├── slicer.py        # 最小子契约切片（选择器校验、security 继承、$ref 闭包重建、SHA-256）
 │   ├── composer.py      # 网关契约合成（前缀规范化、命名空间化、$ref 改写、冲突检测、来源映射）
 │   ├── examples.py      # 媒体类型示例校验（方向化 readOnly/writeOnly/required、3.0/3.1 可空性、JSON Schema 关键字）
 │   ├── overlay.py       # 有序覆盖动作（受限 JSONPath 解析、命中冻结、递归合并/倒序删除、SHA-256）
+│   ├── materializer.py  # 请求物化（参数合并、循环安全 $ref、path/query/header/cookie 样式序列化、百分号编码）
 │   └── refresolver.py   # 本地 $ref 解析（RFC 6901 指针 + 循环检测）
 ├── tests/
 │   ├── test_audit_api.py
 │   ├── test_slice_api.py
 │   ├── test_compose_api.py
 │   ├── test_examples_api.py
-│   └── test_overlay_api.py
+│   ├── test_overlay_api.py
+│   └── test_materialize_api.py
 ├── Dockerfile           # 容器封装全部依赖，非 root 用户运行，含 HEALTHCHECK
 ├── docker-compose.yml   # 一条命令启动，映射 8080 端口
 ├── requirements.txt
